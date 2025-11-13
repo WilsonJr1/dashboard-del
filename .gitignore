@@ -1,0 +1,9 @@
+# Local DB credentials (do NOT commit in shared repos)
+db_local.py
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.pyc

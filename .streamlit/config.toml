@@ -1,0 +1,19 @@
+[server]
+# Endereço IP para aceitar conexões (0.0.0.0 = todas as interfaces)
+address = "0.0.0.0"
+
+# Porta onde o servidor vai rodar
+port = 8501
+
+# Configurações de segurança
+enableCORS = false
+enableXsrfProtection = false
+
+# Configurações de rede
+# O servidor estará acessível apenas via IP interno da máquina
+# Para restringir ainda mais, use firewall no sistema operacional
+
+[browser]
+# Não abrir navegador automaticamente
+serverAddress = "localhost"
+serverPort = 8501
