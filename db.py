@@ -11,7 +11,7 @@ def _load_conn_params() -> dict:
     2) Local module: db_local.DB_CONFIG (for dev; keep out of deploy)
     3) Environment variables: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
     """
-    # Prefer Streamlit Cloud/local secrets
+ 
     try:
         if "db" in st.secrets:  # type: ignore[attr-defined]
             s = st.secrets["db"]
@@ -23,12 +23,11 @@ def _load_conn_params() -> dict:
                 "password": s.get("password"),
             }
     except Exception:
-        # st.secrets may not be available outside Streamlit runtime
+      
         pass
 
-    # Local development module fallback
     try:
-        from db_local import DB_CONFIG as LOCAL_DB_CONFIG  # type: ignore
+        from db_local import DB_CONFIG as LOCAL_DB_CONFIG  
         return {
             "host": LOCAL_DB_CONFIG.get("host"),
             "port": int(LOCAL_DB_CONFIG.get("port", 5432)),
@@ -39,7 +38,7 @@ def _load_conn_params() -> dict:
     except Exception:
         pass
 
-    # Fallback to environment variables
+   
     return {
         "host": os.environ.get("DB_HOST"),
         "port": int(os.environ.get("DB_PORT", "5432")),

@@ -1420,13 +1420,13 @@ def main():
                     order_sprints = totals_df["Sprint"].drop_duplicates().tolist()
 
             # Dados para gráfico de barras (apenas categorias desejadas)
-            plot_df = labels_df_norm[labels_df_norm["LabelCat"].isin(["Feature", "Bug", "Bug GLPI", "Não planejada"])]
+            plot_df = labels_df_norm[labels_df_norm["LabelCat"].isin(["Feature", "Bug", "GLPI", "Não planejada"])]
             status_map = {"Previsto": "Previsto", "Realizado": "Realizado"}
             status_col = status_map.get(status_choice, "Realizado")
             plot_df["Quantidade"] = plot_df[status_col]
 
             color_scale = alt.Scale(
-                domain=["Feature", "Bug", "Bug GLPI", "Não planejada"],
+                domain=["Feature", "Bug", "GLPI", "Não planejada"],
                 range=["#4e79a7", "#d62728", "#9467bd", "#ffbf00"],
             )
 
@@ -1440,7 +1440,7 @@ def main():
                         axis=alt.Axis(labelAngle=0),
                         scale=alt.Scale(paddingInner=0.25, paddingOuter=0.1),
                     ),
-                    xOffset=alt.XOffset("LabelCat:N", sort=["Feature", "Bug", "Bug GLPI", "Não planejada"]),
+                    xOffset=alt.XOffset("LabelCat:N", sort=["Feature", "Bug", "GLPI", "Não planejada"]),
                     y=alt.Y("Quantidade:Q"),
                     color=alt.Color("LabelCat:N", scale=color_scale, legend=alt.Legend(title="Categoria")),
                     tooltip=[
@@ -1463,7 +1463,7 @@ def main():
                         axis=alt.Axis(labelAngle=0),
                         scale=alt.Scale(paddingInner=0.25, paddingOuter=0.1),
                     ),
-                    xOffset=alt.XOffset("LabelCat:N", sort=["Feature", "Bug", "Bug GLPI", "Não planejada"]),
+                    xOffset=alt.XOffset("LabelCat:N", sort=["Feature", "Bug", "GLPI", "Não planejada"]),
                     y=alt.Y("Quantidade:Q"),
                     text=alt.Text("Quantidade:Q", format=".0f"),
                 )
