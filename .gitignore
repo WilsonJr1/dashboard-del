@@ -1,5 +1,6 @@
 # Local DB credentials (do NOT commit in shared repos)
 db_local.py
+.env
 
 # Streamlit local secrets
 .streamlit/secrets.toml
