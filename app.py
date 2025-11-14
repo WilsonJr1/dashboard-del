@@ -147,18 +147,19 @@ def compute_sprint_metrics(
             c.name AS cycle_name,
             c.start_date,
             COUNT(DISTINCT ci.issue_id) AS estimadas,
-            COUNT(DISTINCT CASE WHEN i.completed_at IS NOT NULL
+            COUNT(DISTINCT CASE WHEN s."group" = 'completed'
                   AND (c.start_date IS NULL OR i.completed_at >= c.start_date)
                   AND (c.end_date   IS NULL OR i.completed_at <= c.end_date)
                 THEN ci.issue_id END) AS entregues,
             COALESCE(SUM(COALESCE(i.point, ep.key, NULLIF(ep.value, '')::int, 0)), 0) AS pontos_estimados,
-            COALESCE(SUM(CASE WHEN i.completed_at IS NOT NULL
+            COALESCE(SUM(CASE WHEN s."group" = 'completed'
                   AND (c.start_date IS NULL OR i.completed_at >= c.start_date)
                   AND (c.end_date   IS NULL OR i.completed_at <= c.end_date)
                 THEN COALESCE(i.point, ep.key, NULLIF(ep.value, '')::int, 0) ELSE 0 END), 0) AS pontos_entregues
         FROM public.cycle_issues ci
         JOIN public.cycles c  ON c.id = ci.cycle_id
         JOIN public.issues i  ON i.id = ci.issue_id
+        LEFT JOIN public.states s ON s.id = i.state_id
         LEFT JOIN public.estimate_points ep ON ep.id = i.estimate_point_id
         WHERE ci.cycle_id IN ({cycle_ph})
           AND {' AND '.join(filters_sql)}
@@ -262,7 +263,7 @@ def compute_productivity_avg_per_member(
         "ci.deleted_at IS NULL",
         "c.deleted_at IS NULL",
         "i.deleted_at IS NULL",
-        "i.completed_at IS NOT NULL",
+        "s.\"group\" = 'completed'",
         "(c.start_date IS NULL OR i.completed_at >= c.start_date)",
         "(c.end_date   IS NULL OR i.completed_at <= c.end_date)",
     ]
@@ -292,6 +293,7 @@ def compute_productivity_avg_per_member(
             FROM public.cycle_issues ci
             JOIN public.cycles c ON c.id = ci.cycle_id
             JOIN public.issues i ON i.id = ci.issue_id
+            LEFT JOIN public.states s ON s.id = i.state_id
             WHERE {' AND '.join(delivered_filters)}
         )
         SELECT COALESCE(AVG(cnt), 0) AS avg_tasks
@@ -331,7 +333,7 @@ def compute_points_avg_per_member(
         "ci.deleted_at IS NULL",
         "c.deleted_at IS NULL",
         "i.deleted_at IS NULL",
-        "i.completed_at IS NOT NULL",
+        "s.\"group\" = 'completed'",
         "(c.start_date IS NULL OR i.completed_at >= c.start_date)",
         "(c.end_date   IS NULL OR i.completed_at <= c.end_date)",
     ]
@@ -360,6 +362,7 @@ def compute_points_avg_per_member(
             FROM public.cycle_issues ci
             JOIN public.cycles c ON c.id = ci.cycle_id
             JOIN public.issues i ON i.id = ci.issue_id
+            LEFT JOIN public.states s ON s.id = i.state_id
             WHERE {' AND '.join(delivered_filters)}
         )
         SELECT COALESCE(AVG(points_sum), 0) AS avg_points
@@ -656,10 +659,8 @@ def load_issues_for_cycles(
                      THEN '⚠️ Sem prioridade' ELSE NULL END
             ) AS "Alertas",
             CASE
-                WHEN i.completed_at IS NOT NULL
-                 AND (c.start_date IS NULL OR i.completed_at >= c.start_date)
-                 AND (c.end_date   IS NULL OR i.completed_at <= c.end_date)
-                THEN 'Entregue' ELSE 'Não entregue'
+                WHEN s."group" = 'completed' THEN 'Entregue'
+                ELSE 'Não entregue'
             END AS "Entrega",
             (
                 SELECT STRING_AGG(COALESCE(u.display_name, u.username), ', ')
@@ -676,6 +677,23 @@ def load_issues_for_cycles(
         ORDER BY c.start_date NULLS FIRST, c.name, i.id
     """
     return get_df(sql, tuple(params))
+
+@st.cache_data(ttl=120)
+def get_current_sprint_id(project_id: str) -> str | None:
+    """Identifica o ID da sprint atual (que começou e ainda não terminou)."""
+    sql = """
+        SELECT c.id
+        FROM public.cycles c
+        WHERE c.project_id = %s
+          AND c.deleted_at IS NULL
+          AND c.start_date IS NOT NULL
+          AND c.start_date <= NOW()
+          AND (c.end_date IS NULL OR c.end_date >= NOW())
+        ORDER BY c.start_date DESC
+        LIMIT 1
+    """
+    result = get_df(sql, (project_id,))
+    return result.iloc[0]["id"] if not result.empty else None
 
 @st.cache_data(ttl=120)
 def load_issues_for_current_sprint(
@@ -755,10 +773,8 @@ def load_issues_for_current_sprint(
                      THEN '⚠️ Sem prioridade' ELSE NULL END
             ) AS "Alertas",
             CASE
-                WHEN i.completed_at IS NOT NULL
-                 AND (c.start_date IS NULL OR i.completed_at >= c.start_date)
-                 AND (c.end_date   IS NULL OR i.completed_at <= c.end_date)
-                THEN 'Entregue' ELSE 'Não entregue'
+                WHEN s."group" = 'completed' THEN 'Entregue'
+                ELSE 'Não entregue'
             END AS "Entrega",
             (
                 SELECT STRING_AGG(COALESCE(u.display_name, u.username), ', ')
@@ -934,7 +950,7 @@ def compute_label_breakdown_for_cycles(
                             OR lm.labels ILIKE ('%%' || b.project_prefix || '%%unplanned%%')
                             OR lm.labels ~* '(nao|não)[\s\-_]*planejada'
                             OR lm.labels ILIKE '%%unplanned%%'
-                          ) THEN 'Não planejada'
+                          ) THEN b.project_prefix || '-Unplanned'
                       WHEN (
                             lm.labels ~* ('(^|[,\s\-_])' || b.project_prefix || '[-_]*bug[-_]*glpi([,\s\-_]|$)')
                             OR lm.labels ~* ('(^|[,\s\-_])' || b.project_prefix || '[-_]*glpi[-_]*bug([,\s\-_]|$)')
@@ -942,17 +958,17 @@ def compute_label_breakdown_for_cycles(
                             OR lm.labels ILIKE '%%bugglpi%%'
                             OR lm.labels ~* 'bug[\s\-_]*glpi'
                             OR lm.labels ~* 'glpi[\s\-_]*bug'
-                          ) THEN 'Bug GLPI'
+                          ) THEN b.project_prefix || '-GLPI'
                       WHEN (
                             lm.labels ~* ('(^|[,\s\-_])' || b.project_prefix || '[-_]*bug([,\s\-_]|$)')
                             OR lm.labels ~* '(^|[,\s\-_])bug([,\s\-_]|$)'
                             OR tm.type_name = 'bug'
-                          ) THEN 'Bug'
+                          ) THEN b.project_prefix || '-Bug'
                       WHEN (
                             lm.labels ~* ('(^|[,\s\-_])' || b.project_prefix || '[-_]*feature([,\s\-_]|$)')
                             OR lm.labels ~* '(^|[,\s\-_])feature([,\s\-_]|$)'
                             OR tm.type_name = 'feature'
-                          ) THEN 'Feature'
+                          ) THEN b.project_prefix || '-Feature'
                       ELSE 'Outros'
                     END AS label_cat
             FROM base b
@@ -965,8 +981,6 @@ def compute_label_breakdown_for_cycles(
                COUNT(DISTINCT c.issue_id) AS "Previsto",
                COUNT(DISTINCT CASE
                                 WHEN c.completed_at IS NOT NULL
-                                 AND (c.start_date IS NULL OR c.completed_at >= c.start_date)
-                                 AND (c.end_date IS NULL OR c.completed_at <= c.end_date)
                                 THEN c.issue_id END) AS "Realizado"
         FROM classified c
         GROUP BY c.cycle_id, c.cycle_name, c.label_cat
@@ -1129,14 +1143,24 @@ def main():
     cy_names = st.sidebar.multiselect("Sprints", list(cy_name_to_id.keys()))
     cycle_ids = [cy_name_to_id[name] for name in cy_names]
 
-    # Seleção efetiva de sprints: as escolhidas ou fallback para últimas 3 por start_date
-    effective_cycle_ids = cycle_ids
+    # Identificar sprint atual
+    current_sprint_id = get_current_sprint_id(project_id)
+    
+    # Seleção efetiva de sprints: as escolhidas ou fallback para sprint atual e anterior
+    effective_cycle_ids = cycle_ids  # Usar as sprints selecionadas pelo usuário
+    
+    # Se nenhuma sprint foi selecionada, usar sprint atual e a anterior
     if not effective_cycle_ids and not cycles.empty:
         try:
+            # Ordenar sprints por data de início (mais recente primeiro)
             cycles_sorted = cycles.dropna(subset=["start_date"]).sort_values("start_date", ascending=False)
-            effective_cycle_ids = list(cycles_sorted["id"].head(3))
+            
+            # Pegar as duas sprints mais recentes (atual e anterior)
+            effective_cycle_ids = list(cycles_sorted["id"].head(2))
+            
             if effective_cycle_ids:
-                st.info("Usando as últimas 3 sprints por padrão.")
+                sprint_names = [cycles.loc[cycles["id"] == cid, "name"].iloc[0] for cid in effective_cycle_ids]
+                st.info(f"Usando sprints por padrão: {', '.join(sprint_names)}")
         except Exception:
             effective_cycle_ids = []
 
@@ -1372,9 +1396,28 @@ def main():
             cycles_idx = cycles[["id", "start_date"]].rename(columns={"id": "cycle_id"})
             totals_df = totals_df.merge(cycles_idx, on="cycle_id", how="left")
             totals_df["start_date"] = pd.to_datetime(totals_df["start_date"], errors="coerce")
+            # Filtrar sprints inválidos ou com nomes vazios
+            totals_df = totals_df[totals_df["Sprint"].notna() & (totals_df["Sprint"].str.strip() != "") & (totals_df["Sprint"] != "Sprint")]
+            
             # Ordenação por data de início da sprint
             order_df = totals_df.sort_values(["start_date", "Sprint"], ascending=[True, True])
             order_sprints = order_df["Sprint"].drop_duplicates().tolist()
+
+            # Preencher sprints ausentes com valores zero para evitar desconexões no gráfico
+            if order_sprints:
+                # Assumir nomes como "Sprint X" e encontrar min/max numérico
+                sprint_nums = [int(s.split()[-1]) for s in order_sprints if s.startswith("Sprint ") and s.split()[-1].isdigit()]
+                if sprint_nums:
+                    min_sprint = min(sprint_nums)
+                    max_sprint = max(sprint_nums)
+                    all_sprints = [f"Sprint {i}" for i in range(min_sprint, max_sprint + 1)]
+
+                    # Reindexar totals_df para incluir todas as sprints, preenchendo com 0
+                    totals_df = totals_df.set_index("Sprint").reindex(all_sprints).fillna(0).reset_index()
+                    totals_df = totals_df.rename(columns={"index": "Sprint"})
+
+                    # Reordenar order_sprints para incluir as preenchidas
+                    order_sprints = totals_df["Sprint"].drop_duplicates().tolist()
 
             # Dados para gráfico de barras (apenas categorias desejadas)
             plot_df = labels_df_norm[labels_df_norm["LabelCat"].isin(["Feature", "Bug", "Bug GLPI", "Não planejada"])]
@@ -1554,10 +1597,13 @@ def main():
         )
         if not worked_df.empty:
             choice = st.session_state.get("worked_filter", "Todas")
+            
+
+            
             if choice == "Entregue":
-                worked_df = worked_df[worked_df["Entrega"] == "Entregue"]
+                worked_df = worked_df[worked_df["Entrega"].str.strip() == "Entregue"]
             elif choice == "Não entregue":
-                worked_df = worked_df[worked_df["Entrega"] == "Não entregue"]
+                worked_df = worked_df[worked_df["Entrega"].str.strip() == "Não entregue"]
             elif choice == "Com alerta":
                 worked_df = worked_df[worked_df["Alertas"].fillna("").str.strip() != ""]
             st.caption(f"Filtro: {choice}. Total de tarefas: {len(worked_df)}")
@@ -1591,10 +1637,13 @@ def main():
         )
         if not current_df.empty:
             choice_cur = st.session_state.get("current_filter", "Todas")
+            
+
+            
             if choice_cur == "Entregue":
-                current_df = current_df[current_df["Entrega"] == "Entregue"]
+                current_df = current_df[current_df["Entrega"].str.strip() == "Entregue"]
             elif choice_cur == "Não entregue":
-                current_df = current_df[current_df["Entrega"] == "Não entregue"]
+                current_df = current_df[current_df["Entrega"].str.strip() == "Não entregue"]
             elif choice_cur == "Com alerta":
                 current_df = current_df[current_df["Alertas"].fillna("").str.strip() != ""]
             st.caption(f"Filtro: {choice_cur}. Total de tarefas: {len(current_df)}")
