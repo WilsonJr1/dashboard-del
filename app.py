@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-from db import get_connection
+from db import get_connection, _load_conn_params
 
 
 @st.cache_data(ttl=60)
@@ -28,15 +28,18 @@ def load_workspaces() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_projects(workspace_id: str) -> pd.DataFrame:
-    return get_df(
-        """
+    # Use string formatting to build query (be careful with SQL injection)
+    # Since workspace_id is a UUID string, this should be safe
+    query = f"""
         SELECT id, name
         FROM public.projects
-        WHERE workspace_id = %s AND deleted_at IS NULL
+        WHERE workspace_id = '{workspace_id}' 
+          AND deleted_at IS NULL
+          AND name ILIKE 'TIME%'
         ORDER BY name
-        """,
-        (workspace_id,),
-    )
+    """
+    
+    return get_df(query)
 
 
 @st.cache_data(ttl=300)
@@ -147,12 +150,12 @@ def compute_sprint_metrics(
             c.name AS cycle_name,
             c.start_date,
             COUNT(DISTINCT ci.issue_id) AS estimadas,
-            COUNT(DISTINCT CASE WHEN s."group" = 'completed'
+            COUNT(DISTINCT CASE WHEN s.name = 'Deployed'
                   AND (c.start_date IS NULL OR i.completed_at >= c.start_date)
                   AND (c.end_date   IS NULL OR i.completed_at <= c.end_date)
                 THEN ci.issue_id END) AS entregues,
             COALESCE(SUM(COALESCE(i.point, ep.key, NULLIF(ep.value, '')::int, 0)), 0) AS pontos_estimados,
-            COALESCE(SUM(CASE WHEN s."group" = 'completed'
+            COALESCE(SUM(CASE WHEN s.name = 'Deployed'
                   AND (c.start_date IS NULL OR i.completed_at >= c.start_date)
                   AND (c.end_date   IS NULL OR i.completed_at <= c.end_date)
                 THEN COALESCE(i.point, ep.key, NULLIF(ep.value, '')::int, 0) ELSE 0 END), 0) AS pontos_entregues
@@ -263,7 +266,7 @@ def compute_productivity_avg_per_member(
         "ci.deleted_at IS NULL",
         "c.deleted_at IS NULL",
         "i.deleted_at IS NULL",
-        "s.\"group\" = 'completed'",
+        "s.name = 'Deployed'",
         "(c.start_date IS NULL OR i.completed_at >= c.start_date)",
         "(c.end_date   IS NULL OR i.completed_at <= c.end_date)",
     ]
@@ -333,7 +336,7 @@ def compute_points_avg_per_member(
         "ci.deleted_at IS NULL",
         "c.deleted_at IS NULL",
         "i.deleted_at IS NULL",
-        "s.\"group\" = 'completed'",
+        "s.name = 'Deployed'",
         "(c.start_date IS NULL OR i.completed_at >= c.start_date)",
         "(c.end_date   IS NULL OR i.completed_at <= c.end_date)",
     ]
@@ -439,6 +442,7 @@ def compute_time_metrics_for_cycles(
                    i.id AS issue_id,
                    i.completed_at,
                    i.created_at AS issue_created_at,
+                   i.state_id,
                    (
                      SELECT MIN(iv.start_date)
                      FROM public.issue_versions iv
@@ -451,12 +455,22 @@ def compute_time_metrics_for_cycles(
             WHERE {' AND '.join(base_filters)}
         )
         SELECT
-           COALESCE(AVG((b.completed_at::date - b.issue_created_at::date)), 0) AS lead_days_avg,
-           COALESCE(AVG((b.completed_at::date - COALESCE(b.iv_started_on, b.issue_start_date, b.committed_at::date))), 0) AS cycle_days_avg
+           COALESCE(AVG(CASE 
+               WHEN b.completed_at IS NOT NULL AND b.issue_created_at IS NOT NULL 
+               THEN (b.completed_at::date - b.issue_created_at::date) 
+               ELSE NULL 
+           END), 0) AS lead_days_avg,
+           COALESCE(AVG(CASE 
+               WHEN b.completed_at IS NOT NULL 
+               THEN (b.completed_at::date - COALESCE(b.iv_started_on, b.issue_start_date, b.committed_at::date, b.issue_created_at::date)) 
+               ELSE NULL 
+           END), 0) AS cycle_days_avg
         FROM base b
+        JOIN public.states s ON s.id = b.state_id
         WHERE b.completed_at IS NOT NULL
           AND (b.start_date IS NULL OR b.completed_at >= b.start_date)
           AND (b.end_date   IS NULL OR b.completed_at <= b.end_date)
+          AND s.name = 'Deployed'
     """
 
     try:
@@ -526,6 +540,7 @@ def compute_member_metrics_for_cycles(
                    i.id AS issue_id,
                    i.completed_at AS completed_at,
                    i.created_at::date AS issue_created_at,
+                   i.state_id AS state_id,
                    (
                      SELECT MIN(iv.start_date)::date
                      FROM public.issue_versions iv
@@ -539,10 +554,11 @@ def compute_member_metrics_for_cycles(
             LEFT JOIN public.estimate_points ep ON ep.id = i.estimate_point_id
             WHERE {' AND '.join(base_filters)}
         ), delivered AS (
-            SELECT b.*, ia.assignee_id, COALESCE(u.display_name, u.username) AS dev_name
+            SELECT b.*, ia.assignee_id, COALESCE(u.display_name, u.username) AS dev_name, s.name as state_name
             FROM base b
             JOIN public.issue_assignees ia ON ia.issue_id = b.issue_id AND ia.deleted_at IS NULL {assignee_filter_sql}
             LEFT JOIN public.users u ON u.id = ia.assignee_id
+            LEFT JOIN public.states s ON s.id = b.state_id
         )
         SELECT
             d.dev_name AS "Dev",
@@ -550,26 +566,39 @@ def compute_member_metrics_for_cycles(
                 WHERE d.completed_at IS NOT NULL
                   AND (d.start_date IS NULL OR d.completed_at >= d.start_date)
                   AND (d.end_date   IS NULL OR d.completed_at <= d.end_date)
+                  AND d.state_name = 'Deployed'
             ) AS "Realizado",
             COALESCE(SUM(d.point) FILTER (
                 WHERE d.completed_at IS NOT NULL
                   AND (d.start_date IS NULL OR d.completed_at >= d.start_date)
                   AND (d.end_date   IS NULL OR d.completed_at <= d.end_date)
+                  AND d.state_name = 'Deployed'
             ), 0) AS "Pontos entregues",
             COALESCE(AVG(d.point::double precision) FILTER (
                 WHERE d.completed_at IS NOT NULL
                   AND (d.start_date IS NULL OR d.completed_at >= d.start_date)
                   AND (d.end_date   IS NULL OR d.completed_at <= d.end_date)
+                  AND d.state_name = 'Deployed'
             ), 0) AS "Pontos médios por issue",
-            COALESCE(AVG(EXTRACT(EPOCH FROM (d.completed_at - d.issue_created_at)) / 86400.0) FILTER (
+            COALESCE(AVG(CASE 
+                WHEN d.completed_at IS NOT NULL AND d.issue_created_at IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (d.completed_at - d.issue_created_at)) / 86400.0
+                ELSE NULL
+            END) FILTER (
                 WHERE d.completed_at IS NOT NULL
                   AND (d.start_date IS NULL OR d.completed_at >= d.start_date)
                   AND (d.end_date   IS NULL OR d.completed_at <= d.end_date)
+                  AND d.state_name = 'Deployed'
             ), 0) AS "Lead Time médio (dias)",
-            COALESCE(AVG(EXTRACT(EPOCH FROM (d.completed_at - COALESCE(d.iv_started_on, d.issue_start_date, d.committed_at)) ) / 86400.0) FILTER (
+            COALESCE(AVG(CASE 
+                WHEN d.completed_at IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (d.completed_at - COALESCE(d.iv_started_on, d.issue_start_date, d.committed_at, d.issue_created_at))) / 86400.0
+                ELSE NULL
+            END) FILTER (
                 WHERE d.completed_at IS NOT NULL
                   AND (d.start_date IS NULL OR d.completed_at >= d.start_date)
                   AND (d.end_date   IS NULL OR d.completed_at <= d.end_date)
+                  AND d.state_name = 'Deployed'
             ), 0) AS "Cycle Time médio (dias)"
         FROM delivered d
         GROUP BY d.dev_name
@@ -659,7 +688,7 @@ def load_issues_for_cycles(
                      THEN '⚠️ Sem prioridade' ELSE NULL END
             ) AS "Alertas",
             CASE
-                WHEN s."group" = 'completed' THEN 'Entregue'
+                WHEN s.name = 'Deployed' THEN 'Entregue'
                 ELSE 'Não entregue'
             END AS "Entrega",
             (
@@ -919,6 +948,7 @@ def compute_label_breakdown_for_cycles(
                    ci.created_at AS ci_created_at,
                    i.id AS issue_id,
                    i.completed_at,
+                   i.state_id,
                    i.type_id,
                    LOWER(p.identifier) AS project_prefix
             FROM public.cycle_issues ci
@@ -944,6 +974,7 @@ def compute_label_breakdown_for_cycles(
                    b.ci_created_at,
                    b.issue_id,
                    b.completed_at,
+                   b.state_id,
                     CASE
                       WHEN (
                             lm.labels ~* ('(^|[,\s\-_])' || b.project_prefix || '[-_]*(nao|não)[- _]*planejada([,\s\-_]|$)')
@@ -980,9 +1011,11 @@ def compute_label_breakdown_for_cycles(
                c.label_cat AS "LabelCat",
                COUNT(DISTINCT c.issue_id) AS "Previsto",
                COUNT(DISTINCT CASE
-                                WHEN c.completed_at IS NOT NULL
+                                WHEN c.completed_at IS NOT NULL 
+                                AND s.name = 'Deployed'
                                 THEN c.issue_id END) AS "Realizado"
         FROM classified c
+        LEFT JOIN public.states s ON s.id = c.state_id
         GROUP BY c.cycle_id, c.cycle_name, c.label_cat
         ORDER BY c.cycle_id, c.cycle_name, c.label_cat
     """
@@ -1129,7 +1162,7 @@ def main():
 
     projects = load_projects(workspace_id)
     if projects.empty:
-        st.warning("Nenhum projeto encontrado para o workspace selecionado.")
+        st.warning("Nenhum projeto encontrado para o workspace selecionado que comece com 'TIME'.")
         return
 
     prj_name_to_id = {row["name"]: row["id"] for _, row in projects.iterrows()}
